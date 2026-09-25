@@ -17,7 +17,7 @@ class RecallFlowTest(unittest.TestCase):
         r = self.s.submit_recall("maker", "manufacturer", r["id"], r["revision"])
         return self.s.review_recall("reg", "regulator", r["id"], "publish", r["revision"], "同意发布")
 
-    def test_publish_cross_border_repair_scope_change_and_unfinished(self):
+    def test_publish_cross_border_repair_amendment_and_unfinished(self):
         recall = self.make_recall()
         vehicle = self.s.register_vehicle("maker", "manufacturer", "LX00001", "X", 2018, "CN", "张三")
         self.s.register_vehicle("maker", "manufacturer", "LX00002", "X", 2018, "CN", "李四")
@@ -29,9 +29,14 @@ class RecallFlowTest(unittest.TestCase):
         self.assertEqual("confirmed", confirmed["status"])
         before = self.s.unfinished("reg", "regulator", recall["id"])
         self.assertEqual(1, before["unfinished_count"])
-        changed = self.s.change_scope("maker", "manufacturer", recall["id"], {"models": ["X"], "model_years": [2018], "vin_prefixes": ["LX"], "countries": ["CN"]}, recall["revision"])
-        self.assertEqual(2, changed["scope_version"])
+        new_scope = {"models": ["X"], "model_years": [2018], "vin_prefixes": ["LX"], "countries": ["CN"]}
+        amendment = self.s.submit_amendment("maker", "manufacturer", recall["id"], new_scope, "核对后范围不变，留档确认", recall["revision"], "am-1")
+        self.assertEqual("pending", amendment["status"])
+        reviewed = self.s.review_amendment("reg", "regulator", recall["id"], amendment["id"], "approve", "同意")
+        self.assertEqual("approved", reviewed["status"])
+        self.assertEqual(2, reviewed["result"]["scope_version"])
         detail = self.s.recall_detail(recall["id"])
+        self.assertEqual(2, detail["scope_version"])
         self.assertEqual(2, len(detail["reports"]))
         self.assertEqual("confirmed", detail["repairs"][0]["status"])
 

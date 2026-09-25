@@ -1,1 +1,54 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>车辆召回跟踪</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>车辆安全召回与修复跟踪</h1><p>召回范围按版本发布，维修记录需结合车辆流转、零件库存、跨境许可和监管复核。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>车辆召回跟踪</title>
+<style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+pre{background:#f3f5f7;padding:16px;overflow:auto}
+button{padding:8px 14px}
+.card{border:1px solid #d7dde3;border-radius:8px;padding:12px 16px;margin:12px 0}
+.card h3{margin:4px 0}
+.am{border-left:4px solid #9aa5b1;background:#f8fafc;padding:8px 12px;margin:8px 0;font-size:14px}
+.am.pending{border-color:#d97706;background:#fffbeb}
+.am.approved{border-color:#059669;background:#ecfdf5}
+.am.rejected{border-color:#dc2626;background:#fef2f2}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;background:#e2e8f0;font-size:12px;margin-left:6px}
+</style>
+<h1>车辆安全召回与修复跟踪</h1>
+<p>召回发布后，范围调整以“待审修正”进行：企业提交新范围、原因和版本号，监管通过前原范围照常执行；通过后新增车辆进入通知/上报队列，移出车辆的未完成通知撤销。</p>
+<button onclick="loadState()">刷新状态</button>
+<h2>召回与范围修正</h2>
+<div id="recalls">加载中...</div>
+<h2>原始状态</h2>
+<pre id="state">加载中...</pre>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const statusText={pending:'待审',approved:'已通过',rejected:'已退回'};
+const fmtScope=s=>`车型 ${(s.models||[]).join('/')} ｜ 年款 ${(s.model_years||[]).join('/')} ｜ VIN前缀 ${(s.vin_prefixes||[]).join('/')} ｜ 国家 ${(s.countries||[]).join('/')}`;
+const vins=list=>list&&list.length?list.map(v=>esc(v.vin)).join('、'):'无';
+function fieldHtml(fields){
+  if(!fields||!Object.keys(fields).length)return'';
+  const names={models:'车型',model_years:'年款',vin_prefixes:'VIN前缀',countries:'国家'};
+  return'<br>字段变化:'+Object.entries(fields).map(([k,v])=>`${names[k]||k}(+${esc(v.added.join(','))||'∅'} / -${esc(v.removed.join(','))||'∅'})`).join('；');
+}
+function amendmentHtml(a){
+  const d=a.diff||{added:[],removed:[]};
+  let h=`<div class="am ${a.status}"><b>修正 #${a.id}</b><span class="tag">${statusText[a.status]||a.status}</span> 基于范围版本 v${a.base_scope_version}，由 ${esc(a.created_by)} 提交于 ${esc(a.created_at)}`;
+  h+=`<br>原因:${esc(a.reason)}`;
+  h+=`<br>待审范围:${esc(fmtScope(a.scope))}`;
+  h+=`<br>差异:新增 ${d.added.length} 辆(${vins(d.added)}) ｜ 移出 ${d.removed.length} 辆(${vins(d.removed)})${fieldHtml(d.fields)}`;
+  if(a.result){const r=a.result;
+    h+=`<br>处置结果:生效范围版本 v${r.scope_version} ｜ 新增通知 ${r.notifications_created} 条 ｜ 撤销通知 ${r.notifications_cancelled} 条 ｜ 监管上报单 #${r.report_id} ｜ 当前在范围 ${r.affected_count} 辆`;
+  }
+  if(a.reviewed_by)h+=`<br>审核:${esc(a.reviewed_by)} ${esc(a.reviewed_at)}${a.review_note?' ｜ 意见:'+esc(a.review_note):''}`;
+  return h+'</div>';
+}
+async function loadState(){
+  const data=await(await fetch('/api/state')).json();
+  state.textContent=JSON.stringify(data,null,2);
+  recalls.innerHTML=data.recalls.length?data.recalls.map(r=>{
+    const ams=(r.amendments&&r.amendments.length)?r.amendments.map(amendmentHtml).join(''):'<i>暂无范围修正申请</i>';
+    return`<div class="card"><h3>#${r.id} ${esc(r.title)}(${esc(r.campaign_code)})</h3>`+
+      `<p>状态:${esc(r.state)} ｜ 现行范围版本:v${r.scope_version} ｜ 修订:${r.revision}</p>`+
+      `<p>现行范围:${esc(fmtScope(r.scope))}</p><h4>范围修正</h4>${ams}</div>`;
+  }).join(''):'<i>暂无召回</i>';
+}
+loadState();
+</script>

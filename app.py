@@ -3,29 +3,19 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sqlite3
-import sys
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+
+from recall import ApiError, j, now
+from recall import diff, versions
+from recall.api import Handler
+
+__all__ = ["ApiError", "RecallService", "Store", "j", "now"]
 
 DB_PATH = Path(__file__).with_name("data.db")
-
-
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def j(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
 
 
 class Store:
@@ -57,9 +47,19 @@ class Store:
         );
         CREATE TABLE IF NOT EXISTS scope_changes (
           id INTEGER PRIMARY KEY AUTOINCREMENT, recall_id INTEGER NOT NULL REFERENCES recalls(id),
-          scope_version INTEGER NOT NULL, scope_json TEXT NOT NULL, created_by TEXT NOT NULL,
-          created_at TEXT NOT NULL, UNIQUE(recall_id,scope_version)
+          scope_version INTEGER NOT NULL, scope_json TEXT NOT NULL, reason TEXT, amendment_id INTEGER,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(recall_id,scope_version)
         );
+        CREATE TABLE IF NOT EXISTS scope_amendments (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, recall_id INTEGER NOT NULL REFERENCES recalls(id),
+          base_scope_version INTEGER NOT NULL, scope_json TEXT NOT NULL, reason TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected')),
+          diff_json TEXT, result_json TEXT, idempotency_key TEXT,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          reviewed_by TEXT, reviewed_at TEXT, review_note TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS one_pending_amendment ON scope_amendments(recall_id) WHERE status='pending';
+        CREATE UNIQUE INDEX IF NOT EXISTS amendment_idempotency ON scope_amendments(recall_id, idempotency_key);
         CREATE TABLE IF NOT EXISTS parts (
           id INTEGER PRIMARY KEY AUTOINCREMENT, recall_id INTEGER NOT NULL REFERENCES recalls(id),
           dealer_id INTEGER NOT NULL REFERENCES dealers(id), remedy_version INTEGER NOT NULL,
@@ -91,6 +91,12 @@ class Store:
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        # 兼容旧库：scope_changes 补充留档依据列
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(scope_changes)")}
+        if "reason" not in columns:
+            self.conn.execute("ALTER TABLE scope_changes ADD COLUMN reason TEXT")
+        if "amendment_id" not in columns:
+            self.conn.execute("ALTER TABLE scope_changes ADD COLUMN amendment_id INTEGER")
         self.conn.commit()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
@@ -150,7 +156,7 @@ class RecallService:
 
     def create_recall(self, actor: str | None, role: str | None, campaign_code: str, title: str, scope: dict, remedy: dict) -> dict:
         actor = self._actor(actor, role, {"manufacturer"})
-        self._validate_scope(scope)
+        diff.validate_scope(scope)
         if not campaign_code.strip() or not remedy.get("description") or not remedy.get("version"):
             raise ApiError(400, "召回活动编号和修复方案不能为空")
         stamp = now()
@@ -193,22 +199,27 @@ class RecallService:
             self.store.audit(actor, f"recall.{state}", "recall", recall["id"], {"note": note, "scope_version": recall["scope_version"]})
         return self._recall_dict(self._row("recalls", recall["id"]))
 
-    def change_scope(self, actor: str | None, role: str | None, recall_id: int, scope: dict, expected_version: int) -> dict:
+    def submit_amendment(self, actor: str | None, role: str | None, recall_id: int, scope: dict, reason: str,
+                         expected_version: int, idempotency_key: str = "") -> dict:
+        """企业提交范围修正申请；监管通过前原范围照常执行，重复申请沿用首次结果。"""
         actor = self._actor(actor, role, {"manufacturer"})
-        self._validate_scope(scope)
+        diff.validate_scope(scope)
+        if not reason.strip(): raise ApiError(400, "修正原因不能为空")
         recall = self._row("recalls", recall_id)
-        if recall["manufacturer"] != actor: raise ApiError(403, "只能调整本机构的召回范围")
-        if recall["state"] != "published": raise ApiError(409, "只有已发布召回可以调整范围")
+        if recall["manufacturer"] != actor: raise ApiError(403, "只能修正本机构的召回范围")
+        if recall["state"] != "published": raise ApiError(409, "只有已发布召回可以提交范围修正")
         if int(expected_version) != int(recall["revision"]): raise ApiError(409, "召回已被修改，请刷新版本")
-        scope_version = int(recall["scope_version"]) + 1
-        with self.conn:
-            self.conn.execute("UPDATE recalls SET scope_json=?,scope_version=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
-                              (j(scope), scope_version, now(), recall_id, expected_version))
-            self.conn.execute("INSERT INTO scope_changes(recall_id,scope_version,scope_json,created_by,created_at) VALUES(?,?,?,?,?)",
-                              (recall_id, scope_version, j(scope), actor, now()))
-            self.store.audit(actor, "recall.scope_change", "recall", recall_id, {"scope_version": scope_version, "scope": scope})
-        self._create_release_artifacts(recall_id, scope_version, actor)
-        return self._recall_dict(self._row("recalls", recall_id))
+        amendment, reused = versions.submit(self.conn, self.store, recall, scope, reason.strip(), actor, idempotency_key.strip())
+        return {**amendment, "reused": reused}
+
+    def review_amendment(self, actor: str | None, role: str | None, recall_id: int, amendment_id: int, decision: str, note: str = "") -> dict:
+        actor = self._actor(actor, role, {"regulator"})
+        recall = self._row("recalls", recall_id)
+        return versions.review(self.conn, self.store, recall, amendment_id, decision, actor, note)
+
+    def list_amendments(self, recall_id: int) -> list[dict]:
+        self._row("recalls", recall_id)
+        return versions.list_for_recall(self.conn, recall_id)
 
     def add_parts(self, actor: str | None, role: str | None, recall_id: int, dealer_id: int, remedy_version: int, quantity: int) -> dict:
         actor = self._actor(actor, role, {"manufacturer", "regulator"})
@@ -237,7 +248,7 @@ class RecallService:
         duplicate = self.conn.execute("SELECT id FROM repairs WHERE recall_id=? AND vehicle_id=? AND status IN ('reported','confirmed')", (recall_id, vehicle["id"])).fetchone()
         if duplicate: raise ApiError(409, "该车辆已有维修记录")
         scope = json.loads(recall["scope_json"])
-        if not self._in_scope(vehicle, scope): raise ApiError(409, "车辆不在当前召回范围内")
+        if not diff.in_scope(vehicle, scope): raise ApiError(409, "车辆不在当前召回范围内")
         cross_border = dealer["country"] != vehicle["country"]
         if cross_border and not border_permit.strip(): raise ApiError(403, "跨境维修需要有效许可")
         part = self.conn.execute("SELECT * FROM parts WHERE recall_id=? AND dealer_id=? AND remedy_version=?", (recall_id, dealer_id, remedy_version)).fetchone()
@@ -267,8 +278,9 @@ class RecallService:
 
     def _create_release_artifacts(self, recall_id: int, scope_version: int, actor: str) -> None:
         recall = self._row("recalls", recall_id); scope = json.loads(recall["scope_json"])
-        vehicles = [row for row in self.conn.execute("SELECT * FROM vehicles ORDER BY id") if self._in_scope(row, scope)]
+        vehicles = [row for row in self.conn.execute("SELECT * FROM vehicles ORDER BY id") if diff.in_scope(row, scope)]
         with self.conn:
+            versions.archive_version(self.conn, recall_id, scope_version, recall["scope_json"], actor, "首次发布")
             for vehicle in vehicles:
                 self.conn.execute("""INSERT OR IGNORE INTO notifications(recall_id,vehicle_id,scope_version,channel,status,created_at)
                                      VALUES(?,?,?, 'owner-notice','queued',?)""", (recall_id, vehicle["id"], scope_version, now()))
@@ -286,21 +298,10 @@ class RecallService:
         current_year = datetime.now(timezone.utc).year
         items = []
         for vehicle in self.conn.execute("SELECT * FROM vehicles ORDER BY vin"):
-            if self._in_scope(vehicle, scope) and vehicle["id"] not in confirmed:
+            if diff.in_scope(vehicle, scope) and vehicle["id"] not in confirmed:
                 items.append({"vin": vehicle["vin"], "model": vehicle["model"], "model_year": vehicle["model_year"],
                               "country": vehicle["country"], "risk": "high" if current_year - int(vehicle["model_year"]) >= 8 else "normal"})
         return {"recall_id": recall_id, "scope_version": recall["scope_version"], "unfinished_count": len(items), "vehicles": items}
-
-    @staticmethod
-    def _in_scope(vehicle: sqlite3.Row, scope: dict) -> bool:
-        return (vehicle["model"] in scope.get("models", []) and int(vehicle["model_year"]) in scope.get("model_years", [])
-                and any(vehicle["vin"].startswith(prefix.upper()) for prefix in scope.get("vin_prefixes", []))
-                and (vehicle["country"] in scope.get("countries", []) or vehicle["origin_country"] in scope.get("countries", [])))
-
-    @staticmethod
-    def _validate_scope(scope: dict) -> None:
-        for key in ("models", "model_years", "vin_prefixes", "countries"):
-            if not scope.get(key): raise ApiError(400, f"召回范围缺少 {key}")
 
     def _recall_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "manufacturer": row["manufacturer"], "campaign_code": row["campaign_code"], "title": row["title"],
@@ -311,12 +312,19 @@ class RecallService:
         result = self._recall_dict(self._row("recalls", recall_id))
         result["repairs"] = [dict(row) for row in self.conn.execute("SELECT * FROM repairs WHERE recall_id=? ORDER BY id", (recall_id,))]
         result["reports"] = [dict(row) for row in self.conn.execute("SELECT * FROM regulatory_reports WHERE recall_id=? ORDER BY scope_version", (recall_id,))]
+        result["notifications"] = [dict(row) for row in self.conn.execute("SELECT * FROM notifications WHERE recall_id=? ORDER BY id", (recall_id,))]
+        result["amendments"] = versions.list_for_recall(self.conn, recall_id)
         return result
 
     def state(self) -> dict:
+        recalls = []
+        for row in self.conn.execute("SELECT * FROM recalls ORDER BY id DESC"):
+            item = self._recall_dict(row)
+            item["amendments"] = versions.list_for_recall(self.conn, row["id"])
+            recalls.append(item)
         return {"dealers": [dict(row) for row in self.conn.execute("SELECT * FROM dealers ORDER BY id")],
                 "vehicles": [dict(row) for row in self.conn.execute("SELECT * FROM vehicles ORDER BY id")],
-                "recalls": [self._recall_dict(row) for row in self.conn.execute("SELECT * FROM recalls ORDER BY id DESC")],
+                "recalls": recalls,
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
     def seed(self) -> None:
@@ -325,57 +333,6 @@ class RecallService:
         if not self.conn.execute("SELECT id FROM recalls LIMIT 1").fetchone():
             recall = self.create_recall("maker-demo", "manufacturer", "RC-2026-001", "制动管路检查", {"models": ["X1"], "model_years": [2018, 2019], "vin_prefixes": ["LX"], "countries": ["CN"]}, {"version": 1, "description": "更换制动管"})
             self.submit_recall("maker-demo", "manufacturer", recall["id"], recall["revision"])
-
-
-class Handler(BaseHTTPRequestHandler):
-    service: RecallService
-
-    def log_message(self, fmt: str, *args: object) -> None: sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
-
-    def _send(self, status: int, body: object) -> None:
-        data = json.dumps(body, ensure_ascii=False).encode(); self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
-
-    def _body(self) -> dict:
-        size = int(self.headers.get("Content-Length", "0"))
-        try: return json.loads(self.rfile.read(size)) if size else {}
-        except json.JSONDecodeError as exc: raise ApiError(400, "JSON 请求体无效") from exc
-
-    def _parts(self) -> list[str]: return [p for p in urlparse(self.path).path.strip("/").split("/") if p]
-
-    def do_GET(self) -> None:
-        try:
-            p = self._parts()
-            if p in (["health"], ["api", "health"]): out = {"status": "ok"}
-            elif p == ["api", "state"]: out = self.service.state()
-            elif len(p) == 3 and p[:2] == ["api", "recalls"]: out = self.service.recall_detail(int(p[2]))
-            elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "unfinished":
-                out = self.service.unfinished(self.headers.get("X-Actor"), self.headers.get("X-Role"), int(p[2]))
-            elif not p:
-                page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
-            else: raise ApiError(404, "接口不存在")
-            self._send(200, out)
-        except ApiError as exc: self._send(exc.status, {"error": exc.message})
-        except Exception as exc: self._send(500, {"error": str(exc)})
-
-    def do_POST(self) -> None:
-        try:
-            p, body = self._parts(), self._body(); actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
-            if p == ["api", "dealers"]: out = self.service.register_dealer(actor, role, body.get("code", ""), body.get("name", ""), body.get("country", ""))
-            elif p == ["api", "vehicles"]: out = self.service.register_vehicle(actor, role, body.get("vin", ""), body.get("model", ""), int(body.get("model_year", 0)), body.get("country", ""), body.get("owner_name", ""))
-            elif len(p) == 4 and p[:2] == ["api", "vehicles"] and p[3] == "transfer": out = self.service.transfer_vehicle(actor, role, p[2], body.get("country", ""), body.get("owner_name", ""))
-            elif p == ["api", "recalls"]: out = self.service.create_recall(actor, role, body.get("campaign_code", ""), body.get("title", ""), body.get("scope", {}), body.get("remedy", {}))
-            elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "submit": out = self.service.submit_recall(actor, role, int(p[2]), int(body.get("expected_version", -1)))
-            elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "review": out = self.service.review_recall(actor, role, int(p[2]), body.get("decision", ""), int(body.get("expected_version", -1)), body.get("note", ""))
-            elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "scope": out = self.service.change_scope(actor, role, int(p[2]), body.get("scope", {}), int(body.get("expected_version", -1)))
-            elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "parts": out = self.service.add_parts(actor, role, int(p[2]), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), int(body.get("quantity", 0)))
-            elif p == ["api", "repairs"]: out = self.service.report_repair(actor, role, int(body.get("recall_id", 0)), body.get("vin", ""), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), body.get("evidence_hash", ""), bool(body.get("evidence_consistent", True)), body.get("border_permit", ""), body.get("idempotency_key", ""))
-            elif len(p) == 4 and p[:2] == ["api", "repairs"] and p[3] == "review": out = self.service.review_repair(actor, role, int(p[2]), body.get("decision", ""), body.get("note", ""))
-            else: raise ApiError(404, "接口不存在")
-            self._send(200, out)
-        except ApiError as exc: self._send(exc.status, {"error": exc.message})
-        except (ValueError, TypeError, sqlite3.IntegrityError) as exc: self._send(400, {"error": str(exc)})
-        except Exception as exc: self._send(500, {"error": str(exc)})
 
 
 def run(port: int, db_path: str, seed: bool) -> None:
